@@ -4,6 +4,9 @@
 
 Microsoft Issue: [microsoft-ui-xaml#10929](https://github.com/microsoft/microsoft-ui-xaml/issues/10929)
 
+I build this workaround because it was affecting My Application:
+Touch Dial - https://ramirez.cr/TouchDial/
+
 ---
 
 ## The Problem
