@@ -20,8 +20,9 @@ namespace YourAppNamespace
         private const nuint SubclassId = 0x5444; // "TD"
 
         // Minimum ms between WM_POINTERUPDATE messages per pointer ID.
-        // 4 ms ≈ 250 Hz cap — imperceptible, prevents semaphore overload.
-        private const int MinUpdateIntervalMs = 4;
+        // 8 ms ≈ 125 Hz cap — smooth enough for UI interaction,
+        // prevents semaphore overload in InputStateManager.
+        private const int MinUpdateIntervalMs = 8;
 
         // Max simultaneous touch contacts forwarded to WinUI 3 (0 = unlimited).
         // Contacts beyond this limit are silently dropped at the Win32 level.
@@ -43,6 +44,26 @@ namespace YourAppNamespace
             _subclassProc ??= WndProc;
             if (SetWindowSubclass(hwnd, _subclassProc, SubclassId, 0))
                 _installedHwnds.Add(hwnd);
+        }
+
+        /// <summary>
+        /// Installs the throttle on a window AND all its child windows.
+        /// WinUI 3 routes WM_POINTER through internal child HWNDs (InputSite,
+        /// DesktopChildSiteBridge) that may bypass the top-level HWND. Subclassing
+        /// them ensures the throttle intercepts touch on all OS builds.
+        /// Additionally, subclassing multiple HWNDs slows the overall message
+        /// pipeline, which independently mitigates the race condition even when
+        /// WM_POINTER messages are routed through WinUI's internal COM path.
+        /// </summary>
+        public static void InstallWithChildren(IntPtr hwnd)
+        {
+            Install(hwnd);
+            EnumChildWindows(hwnd, (childHwnd, _) =>
+            {
+                if (!_installedHwnds.Contains(childHwnd))
+                    Install(childHwnd);
+                return true;
+            }, IntPtr.Zero);
         }
 
         /// <summary>
@@ -117,5 +138,11 @@ namespace YourAppNamespace
         [DllImport("comctl32.dll")]
         private static extern nint DefSubclassProc(
             IntPtr hWnd, uint uMsg, nuint wParam, nint lParam);
+
+        private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumChildWindows(
+            IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
     }
 }

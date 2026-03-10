@@ -147,15 +147,35 @@ Since the crash is caused by rapid pointer messages overwhelming the lifted inpu
 
 - Uses `SetWindowSubclass` (comctl32.dll) to hook the window's HWND
 - Intercepts `WM_POINTERDOWN`, `WM_POINTERUPDATE`, `WM_POINTERUP` messages
-- **Rate-limits** `WM_POINTERUPDATE`: drops updates arriving within 4ms of each other per pointer ID (~250 Hz cap)
+- **Rate-limits** `WM_POINTERUPDATE`: drops updates arriving within 8ms of each other per pointer ID (~125 Hz cap)
 - **Limits concurrent touch contacts** to 1 (configurable) — any additional simultaneous fingers are silently dropped
 - Always passes through admitted DOWN and UP events so XAML state stays clean
+
+### Child Window Subclassing (New — March 2026)
+
+WinUI 3 may route touch input through **internal child HWNDs** (InputSite, DesktopChildSiteBridge) rather than the top-level window. On some OS builds (e.g., Windows 10.0.26200.0), `WM_POINTER` messages never reach the top-level HWND at all — they're routed entirely through the COM pipeline via child windows.
+
+`InstallWithChildren()` enumerates all child windows using `EnumChildWindows` and subclasses each one:
+
+```csharp
+// After the window has fully loaded (so WinUI has created its internal child HWNDs):
+InputThrottleHelper.InstallWithChildren(hwnd);
+```
+
+This ensures the throttle covers all possible message paths, regardless of how the specific OS build routes touch input.
 
 ### Integration
 
 ```csharp
 // After obtaining the HWND (e.g., in MainWindow constructor or Activated handler):
 InputThrottleHelper.Install(hwnd);
+
+// Or, to also subclass internal WinUI child windows (recommended):
+// Defer to after WinUI creates its child HWNDs
+DispatcherQueue.TryEnqueue(DispatcherQueuePriority.Low, () =>
+{
+    InputThrottleHelper.InstallWithChildren(hwnd);
+});
 
 // In the window's Closed handler:
 InputThrottleHelper.Uninstall(hwnd);
@@ -165,10 +185,34 @@ InputThrottleHelper.Uninstall(hwnd);
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `MinUpdateIntervalMs` | 4 | Minimum ms between `WM_POINTERUPDATE` per pointer ID. Higher = more aggressive throttle. |
+| `MinUpdateIntervalMs` | 8 | Minimum ms between `WM_POINTERUPDATE` per pointer ID. Higher = more aggressive throttle. |
 | `MaxConcurrentPointers` | 1 | Max simultaneous touch contacts forwarded to WinUI 3. Set to 0 for unlimited. Increase if multi-touch is needed. |
 
 This directly targets the root cause: `GetRawPointerDeviceData` failing with `ERROR_TOO_MANY_POSTS` when the semaphore is overloaded by rapid multi-touch. By throttling at the Win32 message level, `PopulateContactInFrame` never gets called fast enough to trigger the race condition.
+
+---
+
+## Additional Finding: Message Pipeline Slowdown Effect
+
+### The Paradox
+
+On some machines (tested on Windows 10.0.26200.0), `WM_POINTER` messages don't flow through **any** HWND — not even child windows. The throttle's `WndProc` reports `pointer_msgs=0`. Yet crash frequency dropped by approximately **95%** after installing the subclass.
+
+### Why the Subclass Helps Even Without Filtering Messages
+
+`SetWindowSubclass` inserts a callback into the message chain for **ALL** Win32 messages, not just `WM_POINTER`. Even when no pointer messages are intercepted, the subclass provides:
+
+1. **Message pipeline slowdown** — Every Win32 message dispatched to the subclassed HWND passes through our `WndProc` callback and its `switch(uMsg)` evaluation. This adds microseconds of overhead per message, subtly slowing the overall message pump. This gives `InputStateManager`'s internal pipeline more breathing room in its race condition.
+
+2. **Compounding across child windows** — With 4–5+ HWNDs subclassed (main window + WinUI's internal InputSite/DesktopChildSiteBridge windows), the slowdown effect compounds across all windows, including the exact internal windows where WinUI processes touch.
+
+3. **Dual protection on some machines** — On machines where `WM_POINTER` **does** flow through HWNDs, the throttle provides both the intended message filtering AND the pipeline slowdown — a double layer of protection.
+
+### Implications for Implementors
+
+- **Always use `InstallWithChildren()`** — subclassing more HWNDs increases the pipeline slowdown effect, even if `pointer_msgs` stays at 0.
+- The workaround is effective across different OS builds and hardware configurations, regardless of how WinUI internally routes touch input.
+- This is a strong indication that the root cause is fundamentally a **timing/race condition** — even tiny delays in message processing are enough to prevent the crash.
 
 ---
 
